@@ -1,11 +1,12 @@
 // Non-encrypted CTB V5 format handling
 use crate::engine::SlicerV3Error;
-use crate::types::SliceJobV3;
+use crate::types::{LayerAreaStatsV3, SliceJobV3};
 
 use super::ctb_layout::{
     page_number_and_offset, push_bytes_padded, push_f32, push_u16, push_u32, push_u8, push_u64,
 };
 use super::ctb_metadata::{
+    ctb_multi_parameter_exposure_override,
     decode_embedded_disclaimer_bytes, parse_ctb_build_model_from_job,
     parse_ctb_resin_model_from_job, parse_machine_software_version,
     parse_timing_model_from_metadata,
@@ -317,6 +318,7 @@ fn write_layer_def_ex(
     layer_data_abs_offset: u64,
     layout: LayerDefLayout,
     is_bottom: bool,
+    exposure_override_sec: Option<f32>,
 ) {
     let (page_number, data_offset) = page_number_and_offset(layer_data_abs_offset);
 
@@ -387,7 +389,9 @@ fn write_layer_def_ex(
     } else {
         timing.projector_duty_cycle_pwm
     };
-    let exposure_sec = if is_bottom {
+    let exposure_sec = if let Some(exposure) = exposure_override_sec {
+        exposure
+    } else if is_bottom {
         timing.bottom_exposure_sec
     } else {
         if (layer.index as u32) < (timing.bottom_layer_count + timing.transition_layer_count as u32) {
@@ -453,11 +457,29 @@ fn write_layer_def_ex(
     if matches!(layout, LayerDefLayout::Encrypted) { push_u32(out, 0); }
 }
 
-fn compute_print_time_seconds(prepared_count: usize, timing: CtbTimingModel) -> u32 {
+fn compute_print_time_seconds(
+    job: &SliceJobV3,
+    prepared: &[CtbPreparedLayer],
+    timing: CtbTimingModel,
+    layer_area_stats: &[LayerAreaStatsV3],
+) -> u32 {
     let mut total = 0.0_f32;
-    for i in 0..prepared_count {
-        let is_bottom = (i as u32) < timing.bottom_layer_count;
-        let exposure = if is_bottom {
+    for layer in prepared {
+        let is_bottom = (layer.index as u32) < timing.bottom_layer_count;
+        let area_mm2 = layer_area_stats
+            .get(layer.index)
+            .map(|stats| stats.total_solid_area_mm2);
+        let override_exposure = ctb_multi_parameter_exposure_override(
+            &job.metadata_json,
+            layer.index,
+            job.layer_height_mm,
+            timing.bottom_layer_count,
+            timing.transition_layer_count,
+            area_mm2,
+        );
+        let exposure = if let Some(override_exposure) = override_exposure {
+            override_exposure
+        } else if is_bottom {
             timing.bottom_exposure_sec
         } else {
             timing.normal_exposure_sec
@@ -476,9 +498,10 @@ fn compute_print_time_seconds(prepared_count: usize, timing: CtbTimingModel) -> 
     total.round().max(0.0) as u32
 }
 
-pub(super) fn build_ctb_container_bytes_with_progress(
+pub(super) fn build_ctb_container_bytes_with_area_stats_and_progress(
     job: &SliceJobV3,
     prepared: &[CtbPreparedLayer],
+    layer_area_stats: &[LayerAreaStatsV3],
     on_progress: Option<&dyn Fn(u32, u32)>,
 ) -> Result<Vec<u8>, SlicerV3Error> {
     let timing = parse_timing_model_from_metadata(&job.metadata_json);
@@ -546,7 +569,7 @@ pub(super) fn build_ctb_container_bytes_with_progress(
     let mut layer_defs_data = Vec::with_capacity(prepared.len() * CTB_LAYER_DEF_EX_SIZE as usize);
     let mut layer_payload_data = Vec::new();
 
-    let print_time_sec = compute_print_time_seconds(prepared.len(), timing);
+    let print_time_sec = compute_print_time_seconds(job, prepared, timing, layer_area_stats);
 
     let preview_offsets = CtbPreviewOffsets {
         large_record_offset: large_preview_record_offset,
@@ -663,6 +686,17 @@ pub(super) fn build_ctb_container_bytes_with_progress(
         let mut layer_def_bytes = Vec::new();
 
         let is_bottom = (layer.index as u32) < timing.bottom_layer_count;
+        let area_mm2 = layer_area_stats
+            .get(layer.index)
+            .map(|stats| stats.total_solid_area_mm2);
+        let exposure_override = ctb_multi_parameter_exposure_override(
+            &job.metadata_json,
+            layer.index,
+            job.layer_height_mm,
+            timing.bottom_layer_count,
+            timing.transition_layer_count,
+            area_mm2,
+        );
         let layout = if caps.extended_layer_def { LayerDefLayout::Extended } else { LayerDefLayout::Basic };
         write_layer_def_ex(
             &mut layer_def_bytes,
@@ -672,6 +706,7 @@ pub(super) fn build_ctb_container_bytes_with_progress(
             layer_data_abs,
             layout,
             is_bottom,
+            exposure_override,
         );
 
         if caps.extended_layer_def {
@@ -815,6 +850,7 @@ fn write_encrypted_header(
 pub(super) fn build_ctb_encrypted_container_bytes_with_progress(
     job: &SliceJobV3,
     prepared: &[CtbPreparedLayer],
+    layer_area_stats: &[LayerAreaStatsV3],
     on_progress: Option<&dyn Fn(u32, u32)>,
 ) -> Result<Vec<u8>, SlicerV3Error> {
     let timing = parse_timing_model_from_metadata(&job.metadata_json);
@@ -830,7 +866,7 @@ pub(super) fn build_ctb_encrypted_container_bytes_with_progress(
     let (key, iv) = ctb_default_key_iv();
 
     let layer_count = prepared.len() as u32;
-    let print_time_sec = compute_print_time_seconds(prepared.len(), timing);
+    let print_time_sec = compute_print_time_seconds(job, prepared, timing, layer_area_stats);
     let machine_name_bytes = build.machine_name.as_bytes().to_vec();
     let machine_name_size = machine_name_bytes.len() as u32;
 
@@ -884,7 +920,18 @@ pub(super) fn build_ctb_encrypted_container_bytes_with_progress(
         layer_pointer_entries.push((layer_offset, layer_page));
 
         let is_bottom = (layer.index as u32) < timing.bottom_layer_count;
-        write_layer_def_ex(&mut out, layer, (layer.index as f32 + 1.0) * job.layer_height_mm, timing, layer_data_abs, LayerDefLayout::Encrypted, is_bottom);
+        let area_mm2 = layer_area_stats
+            .get(layer.index)
+            .map(|stats| stats.total_solid_area_mm2);
+        let exposure_override = ctb_multi_parameter_exposure_override(
+            &job.metadata_json,
+            layer.index,
+            job.layer_height_mm,
+            timing.bottom_layer_count,
+            timing.transition_layer_count,
+            area_mm2,
+        );
+        write_layer_def_ex(&mut out, layer, (layer.index as f32 + 1.0) * job.layer_height_mm, timing, layer_data_abs, LayerDefLayout::Encrypted, is_bottom, exposure_override);
         out.extend_from_slice(&layer.encoded);
 
         if let Some(progress) = on_progress {

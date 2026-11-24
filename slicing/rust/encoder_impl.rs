@@ -1,4 +1,5 @@
 mod ctb_crypto;
+mod ctb_edit;
 mod ctb_layout;
 mod ctb_metadata;
 mod ctb_preview;
@@ -14,11 +15,15 @@ use crate::engine::SlicerV3Error;
 use crate::types::{LayerAreaStatsV3, RenderedLayersV3, SliceJobV3};
 use crossbeam_channel::bounded;
 use ctb_layout::{
-    build_ctb_container_bytes, build_ctb_container_bytes_with_progress,
+    build_ctb_container_bytes,
+    build_ctb_container_bytes_with_area_stats_and_progress,
     encode_single_ctb_empty_layer, encode_single_ctb_layer_from_raw_mask, prepare_layers_for_ctb,
     prepare_layers_for_ctb_with_progress,
 };
-use ctb_metadata::{parse_ctb_build_model_from_job, parse_threshold_from_metadata};
+use ctb_metadata::{
+    ctb_multi_parameter_rules_need_area_stats, parse_ctb_build_model_from_job,
+    parse_threshold_from_metadata,
+};
 use std::path::Path;
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -203,9 +208,14 @@ struct CtbRleStreamingEncoder {
     threshold: u8,
     total_pixels: usize,
     prepared: Vec<ctb_types::CtbPreparedLayer>,
+    layer_area_stats: Vec<LayerAreaStatsV3>,
 }
 
 impl RleStreamEncoder for CtbRleStreamingEncoder {
+    fn set_area_stats(&mut self, stats: Vec<LayerAreaStatsV3>) {
+        self.layer_area_stats = stats;
+    }
+
     fn consume_rle_layer(
         &mut self,
         layer_index: u32,
@@ -253,7 +263,12 @@ impl RleStreamEncoder for CtbRleStreamingEncoder {
             ));
         }
         self.prepared.sort_unstable_by_key(|p| p.index);
-        build_ctb_container_bytes(&self.job, &self.prepared)
+        build_ctb_container_bytes_with_area_stats_and_progress(
+            &self.job,
+            &self.prepared,
+            &self.layer_area_stats,
+            None,
+        )
     }
 
     fn parallel_encode_fn(
@@ -323,6 +338,10 @@ impl FormatEncoder for CtbPluginEncoder {
 
     fn requires_raw_mask_layers(&self) -> bool {
         true
+    }
+
+    fn requires_area_stats_for_job(&self, job: &SliceJobV3) -> bool {
+        ctb_multi_parameter_rules_need_area_stats(&job.metadata_json)
     }
 
     fn create_raw_mask_stream_encoder(
@@ -425,6 +444,7 @@ impl FormatEncoder for CtbPluginEncoder {
             threshold,
             total_pixels,
             prepared: Vec::with_capacity(job.total_layers as usize),
+            layer_area_stats: Vec::new(),
         })))
     }
 
@@ -441,7 +461,7 @@ impl FormatEncoder for CtbPluginEncoder {
         &self,
         job: &SliceJobV3,
         rendered_layers: &RenderedLayersV3,
-        _layer_area_stats: &[LayerAreaStatsV3],
+        layer_area_stats: &[LayerAreaStatsV3],
         on_progress: Option<&dyn Fn(u32, u32)>,
     ) -> Result<Vec<u8>, SlicerV3Error> {
         let Some(raw_masks) = rendered_layers.raw_mask_layers.as_ref() else {
@@ -512,9 +532,10 @@ impl FormatEncoder for CtbPluginEncoder {
             }
         });
 
-        let bytes = build_ctb_container_bytes_with_progress(
+        let bytes = build_ctb_container_bytes_with_area_stats_and_progress(
             job,
             &prepared,
+            layer_area_stats,
             layout_progress.as_ref().map(|cb| cb as &dyn Fn(u32, u32)),
         )?;
 
@@ -529,7 +550,7 @@ impl FormatEncoder for CtbPluginEncoder {
         &self,
         job: &SliceJobV3,
         rendered_layers: &RenderedLayersV3,
-        _layer_area_stats: &[LayerAreaStatsV3],
+        layer_area_stats: &[LayerAreaStatsV3],
     ) -> Result<Vec<u8>, SlicerV3Error> {
         let Some(raw_masks) = rendered_layers.raw_mask_layers.as_ref() else {
             return Err(SlicerV3Error::MissingRenderedLayerPayload(
@@ -568,7 +589,12 @@ impl FormatEncoder for CtbPluginEncoder {
             )));
         }
 
-        build_ctb_container_bytes(job, &prepared)
+        build_ctb_container_bytes_with_area_stats_and_progress(
+            job,
+            &prepared,
+            layer_area_stats,
+            None,
+        )
     }
 
     fn encode_container_to_path(
@@ -590,6 +616,27 @@ impl FormatEncoder for CtbPluginEncoder {
         layer_number: u32,
     ) -> Result<Vec<u8>, SlicerV3Error> {
         self::read_layer_preview_png(path, layer_number).map_err(SlicerV3Error::LayerPreview)
+    }
+
+    fn replace_layer_pixels_png(
+        &self,
+        path: &Path,
+        layer_number: u32,
+        png_bytes: &[u8],
+    ) -> Result<u64, SlicerV3Error> {
+        ctb_edit::replace_layer_pixels(path, layer_number, png_bytes)
+            .map_err(SlicerV3Error::UnsupportedOutput)
+    }
+
+    fn process_print_islands(
+        &self,
+        path: &Path,
+        minimum_pixels: u32,
+        remove: bool,
+        progress: &dyn Fn(u32, u32),
+    ) -> Result<crate::encoders::PrintIslandReport, SlicerV3Error> {
+        ctb_edit::process_islands(path, minimum_pixels, remove, progress)
+            .map_err(SlicerV3Error::UnsupportedOutput)
     }
 }
 
@@ -615,6 +662,63 @@ pub fn read_layer_preview_png(path: &Path, layer_number: u32) -> Result<Vec<u8>,
     } else {
         read_plain_layer_preview(&mut file, layer_number)
     }
+}
+
+fn decode_png_as_grayscale(
+    png_bytes: &[u8],
+    expected_width: u32,
+    expected_height: u32,
+) -> Result<(u32, u32, Vec<u8>), String> {
+    use std::io::Cursor;
+
+    let mut decoder = png::Decoder::new(Cursor::new(png_bytes));
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = decoder
+        .read_info()
+        .map_err(|error| format!("Edited layer PNG could not be decoded: {error}"))?;
+    let png_width = reader.info().width;
+    let png_height = reader.info().height;
+    if png_width != expected_width || png_height != expected_height {
+        return Err(format!(
+            "Edited image is {png_width}×{png_height}; this CTB requires {expected_width}×{expected_height}."
+        ));
+    }
+    let pixel_count = (png_width as usize)
+        .checked_mul(png_height as usize)
+        .filter(|count| *count <= 40_000_000)
+        .ok_or_else(|| "Edited layer PNG dimensions are too large to decode safely.".to_string())?;
+    let mut decoded = vec![0u8; reader.output_buffer_size()];
+    let output = reader
+        .next_frame(&mut decoded)
+        .map_err(|error| format!("Edited layer PNG could not be read: {error}"))?;
+    let pixels = &decoded[..output.buffer_size()];
+    let mut grayscale = Vec::with_capacity(pixel_count);
+
+    match output.color_type {
+        png::ColorType::Grayscale => grayscale.extend_from_slice(pixels),
+        png::ColorType::GrayscaleAlpha => {
+            for pair in pixels.chunks_exact(2) {
+                grayscale.push(((pair[0] as u16 * pair[1] as u16 + 127) / 255) as u8);
+            }
+        }
+        png::ColorType::Rgb => {
+            for rgb in pixels.chunks_exact(3) {
+                grayscale.push(((rgb[0] as u32 * 299 + rgb[1] as u32 * 587 + rgb[2] as u32 * 114 + 500) / 1000) as u8);
+            }
+        }
+        png::ColorType::Rgba => {
+            for rgba in pixels.chunks_exact(4) {
+                let luminance = (rgba[0] as u32 * 299 + rgba[1] as u32 * 587 + rgba[2] as u32 * 114 + 500) / 1000;
+                grayscale.push(((luminance * rgba[3] as u32 + 127) / 255) as u8);
+            }
+        }
+        png::ColorType::Indexed => return Err("Edited layer PNG palette could not be expanded.".to_string()),
+    }
+
+    if grayscale.len() != pixel_count {
+        return Err("Edited layer PNG has an unsupported pixel layout.".to_string());
+    }
+    Ok((output.width, output.height, grayscale))
 }
 
 /// Reads a layer preview from a non-encrypted CTB file (V2–V5).
@@ -791,6 +895,16 @@ fn read_encrypted_layer_preview(
 
 /// Decodes CTB run-length encoded data into a flat grayscale pixel buffer.
 fn decode_ctb_rle(data: &[u8], expected_pixels: usize) -> Vec<u8> {
+    let (mut pixels, _) = decode_ctb_rle_with_validation(data, expected_pixels, false);
+    pixels.resize(expected_pixels, 0);
+    pixels
+}
+
+fn decode_ctb_rle_checked(data: &[u8], expected_pixels: usize) -> (Vec<u8>, bool) {
+    decode_ctb_rle_with_validation(data, expected_pixels, true)
+}
+
+fn decode_ctb_rle_with_validation(data: &[u8], expected_pixels: usize, strict: bool) -> (Vec<u8>, bool) {
     let mut pixels = Vec::with_capacity(expected_pixels);
     let mut i = 0;
 
@@ -845,14 +959,14 @@ fn decode_ctb_rle(data: &[u8], expected_pixels: usize) -> Vec<u8> {
         };
 
         let remaining = expected_pixels - pixels.len();
-        let fill = (run_len as usize).min(remaining);
-        for _ in 0..fill {
-            pixels.push(pixel);
+        if strict && (run_len == 0 || run_len as usize > remaining) {
+            return (pixels, false);
         }
+        pixels.resize(pixels.len() + (run_len as usize).min(remaining), pixel);
     }
 
-    pixels.resize(expected_pixels, 0);
-    pixels
+    let complete = pixels.len() == expected_pixels && i == data.len();
+    (pixels, complete)
 }
 
 /// Encodes a flat grayscale pixel buffer as an 8-bit grayscale PNG.

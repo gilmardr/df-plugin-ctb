@@ -1,12 +1,12 @@
 // CTB layout and container building - Refactored into V5 encrypted and non-encrypted variants
 
 use crate::engine::SlicerV3Error;
-use crate::types::SliceJobV3;
+use crate::types::{LayerAreaStatsV3, SliceJobV3};
 
 use super::ctb_metadata::parse_ctb_format_version_hint_from_job;
 use super::ctb_types::{CtbPreparedLayer, CTB_PAGE_SIZE};
 
-use super::ctb_encoder::build_ctb_container_bytes_with_progress as build_ctb_v5_with_progress;
+use super::ctb_encoder::build_ctb_container_bytes_with_area_stats_and_progress as build_ctb_v5_with_area_stats_and_progress;
 use super::ctb_encoder::build_ctb_encrypted_container_bytes_with_progress as build_ctb_v5enc_with_progress;
 
 // === Shared utility functions for both encrypted and non-encrypted ===
@@ -298,13 +298,22 @@ pub(super) fn build_ctb_container_bytes_with_progress(
     prepared: &[CtbPreparedLayer],
     on_progress: Option<&dyn Fn(u32, u32)>,
 ) -> Result<Vec<u8>, SlicerV3Error> {
+    build_ctb_container_bytes_with_area_stats_and_progress(job, prepared, &[], on_progress)
+}
+
+pub(super) fn build_ctb_container_bytes_with_area_stats_and_progress(
+    job: &SliceJobV3,
+    prepared: &[CtbPreparedLayer],
+    layer_area_stats: &[LayerAreaStatsV3],
+    on_progress: Option<&dyn Fn(u32, u32)>,
+) -> Result<Vec<u8>, SlicerV3Error> {
     let force_encrypted = parse_ctb_format_version_hint_from_job(job)
         .map(|(_, is_encrypted)| is_encrypted)
         .unwrap_or(false);
 
     if force_encrypted {
-        build_ctb_v5enc_with_progress(job, prepared, on_progress)
+        build_ctb_v5enc_with_progress(job, prepared, layer_area_stats, on_progress)
     } else {
-        build_ctb_v5_with_progress(job, prepared, on_progress)
+        build_ctb_v5_with_area_stats_and_progress(job, prepared, layer_area_stats, on_progress)
     }
 }

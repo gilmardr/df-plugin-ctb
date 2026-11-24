@@ -64,6 +64,79 @@ pub(super) fn parse_threshold_from_metadata(metadata_json: &str) -> u8 {
         .unwrap_or(DEFAULT_BINARY_THRESHOLD)
 }
 
+/// Area rules inspect the union of all illuminated pixels in each layer, so
+/// the rasterizer's connected-component/area metrics are only needed when an
+/// area rule is present.
+pub(super) fn ctb_multi_parameter_rules_need_area_stats(metadata_json: &str) -> bool {
+    let Some(meta) = parse_json(metadata_json) else {
+        return false;
+    };
+    let rules = meta
+        .get("ctb")
+        .and_then(|value| value.get("multiParameterRules"))
+        .or_else(|| {
+            meta.get("export")
+                .and_then(|value| value.get("ctb"))
+                .and_then(|value| value.get("multiParameterRules"))
+        });
+    rules
+        .and_then(Value::as_array)
+        .map(|rules| rules.iter().any(|rule| rule.get("kind").and_then(Value::as_str) == Some("area")))
+        .unwrap_or(false)
+}
+
+/// Return the last matching normal-layer exposure override. Bottom and
+/// transition layers retain their calibrated exposure ramp.
+pub(super) fn ctb_multi_parameter_exposure_override(
+    metadata_json: &str,
+    layer_index: usize,
+    layer_height_mm: f32,
+    bottom_layer_count: u32,
+    transition_layer_count: u32,
+    area_mm2: Option<f64>,
+) -> Option<f32> {
+    if (layer_index as u32) < bottom_layer_count.saturating_add(transition_layer_count) {
+        return None;
+    }
+
+    let meta = parse_json(metadata_json)?;
+    let rules = meta
+        .get("ctb")
+        .and_then(|value| value.get("multiParameterRules"))
+        .or_else(|| {
+            meta.get("export")
+                .and_then(|value| value.get("ctb"))
+                .and_then(|value| value.get("multiParameterRules"))
+        })?
+        .as_array()?;
+    let height_mm = (layer_index as f64 + 1.0) * layer_height_mm as f64;
+
+    rules.iter().rev().find_map(|rule| {
+        let kind = rule.get("kind")?.as_str()?;
+        let min = rule.get("min")?.as_f64()?;
+        let max = rule.get("max").and_then(Value::as_f64);
+        let exposure = rule.get("exposureSec")?.as_f64()?;
+        if !min.is_finite()
+            || min < 0.0
+            || max.map(|value| !value.is_finite() || value < min).unwrap_or(false)
+            || !exposure.is_finite()
+            || exposure <= 0.0
+        {
+            return None;
+        }
+        let measure = match kind {
+            "height" => height_mm,
+            "area" => area_mm2?,
+            _ => return None,
+        };
+        if measure >= min && max.map(|upper| measure <= upper).unwrap_or(true) {
+            Some(exposure as f32)
+        } else {
+            None
+        }
+    })
+}
+
 pub(super) fn parse_timing_model_from_metadata(metadata_json: &str) -> CtbTimingModel {
     let Some(meta) = parse_json(metadata_json) else {
         return CtbTimingModel {
@@ -571,6 +644,10 @@ pub(super) fn parse_ctb_build_model_from_job(job: &SliceJobV3) -> CtbBuildModel 
             .get("export")
             .and_then(|v| v.get("ctb"))
             .and_then(Value::as_object);
+        let has_multi_parameter_rules = [ctb_root, export_ctb_root]
+            .iter()
+            .filter_map(|root| root.and_then(|value| value.get("multiParameterRules")))
+            .any(|rules| rules.as_array().map(|items| !items.is_empty()).unwrap_or(false));
 
         let read_positive_f32 =
             |root: Option<&serde_json::Map<String, Value>>, key: &str| -> bool {
@@ -614,7 +691,8 @@ pub(super) fn parse_ctb_build_model_from_job(job: &SliceJobV3) -> CtbBuildModel 
             .and_then(|v| v.get("ctb"))
             .and_then(|v| v.get("perLayerSettings"))
             .and_then(Value::as_bool);
-        per_layer_settings = pls_direct.or(pls_nested).unwrap_or(per_layer_settings);
+        per_layer_settings = pls_direct.or(pls_nested).unwrap_or(per_layer_settings)
+            || has_multi_parameter_rules;
     }
 
     anti_alias_level = anti_alias_level.max(1);
