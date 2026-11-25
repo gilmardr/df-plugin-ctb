@@ -283,6 +283,19 @@ pub(super) fn encode_preview_rgb15_rle(rgb: &[u8]) -> Vec<u8> {
 }
 
 pub(super) fn build_previews(job: &SliceJobV3) -> Result<[CtbPreviewBlob; 2], SlicerV3Error> {
+    let [large, small] = build_previews_sized(
+        job,
+        [(PREVIEW_LARGE_W, PREVIEW_LARGE_H), (PREVIEW_SMALL_W, PREVIEW_SMALL_H)],
+    )?;
+    Ok([large, small])
+}
+
+/// Builds RGB15 RLE previews at the given sizes, in the order given. Formats that
+/// share the Chitu preview codec but not its sizes (CXDLPv4) call this directly.
+pub(super) fn build_previews_sized(
+    job: &SliceJobV3,
+    sizes: [(u32, u32); 2],
+) -> Result<[CtbPreviewBlob; 2], SlicerV3Error> {
     let source_rgb = if let Some(base64_png) = job.export_thumbnail_png_base64.as_ref() {
         let png_bytes = decode_base64_data_url_or_plain(base64_png)?;
         let (w, h, rgb) = decode_png_rgba8(&png_bytes)?;
@@ -307,8 +320,8 @@ pub(super) fn build_previews(job: &SliceJobV3) -> Result<[CtbPreviewBlob; 2], Sl
     };
 
     Ok([
-        build_one(PREVIEW_LARGE_W, PREVIEW_LARGE_H),
-        build_one(PREVIEW_SMALL_W, PREVIEW_SMALL_H),
+        build_one(sizes[0].0, sizes[0].1),
+        build_one(sizes[1].0, sizes[1].1),
     ])
 }
 

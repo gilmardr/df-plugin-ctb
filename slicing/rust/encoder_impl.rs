@@ -7,6 +7,7 @@ mod ctb_types;
 //mod ctb_v5;
 //mod ctb_v5enc;
 mod ctb_encoder;
+mod cxdlpv4_encoder;
 
 use crate::encoders::FormatEncoder;
 use crate::encoders::RawMaskStreamEncoder;
@@ -322,7 +323,152 @@ impl RleStreamEncoder for CtbRleStreamingEncoder {
 }
 
 pub fn create_plugin_encoder() -> Vec<Box<dyn FormatEncoder>> {
-    vec![Box::new(CtbPluginEncoder)]
+    vec![Box::new(CtbPluginEncoder), Box::new(Cxdlpv4PluginEncoder)]
+}
+
+/// Creality CXDLPv4 encoder. Shares the CTB layer RLE, previews and resin
+/// settings; the container itself lives in `cxdlpv4_encoder.rs`.
+pub struct Cxdlpv4PluginEncoder;
+
+struct Cxdlpv4RleStreamingEncoder {
+    job: SliceJobV3,
+    is_anti_aliased: bool,
+    threshold: u8,
+    total_pixels: usize,
+    prepared: Vec<ctb_types::CtbPreparedLayer>,
+    layer_area_stats: Vec<LayerAreaStatsV3>,
+}
+
+impl RleStreamEncoder for Cxdlpv4RleStreamingEncoder {
+    fn set_area_stats(&mut self, stats: Vec<LayerAreaStatsV3>) {
+        self.layer_area_stats = stats;
+    }
+
+    fn consume_rle_layer(
+        &mut self,
+        layer_index: u32,
+        runs: Vec<crate::rle::RleRun>,
+    ) -> Result<(), SlicerV3Error> {
+        let encoded = cxdlpv4_encoder::encode_cxdlpv4_rle_layer(
+            &runs,
+            self.total_pixels,
+            self.is_anti_aliased,
+            self.threshold,
+        );
+        self.store_encoded_layer(layer_index, encoded);
+        Ok(())
+    }
+
+    fn finalize_to_bytes(mut self: Box<Self>) -> Result<Vec<u8>, SlicerV3Error> {
+        self.prepared.sort_unstable_by_key(|p| p.index);
+        cxdlpv4_encoder::build_cxdlpv4_container_bytes(
+            &self.job,
+            &self.prepared,
+            &self.layer_area_stats,
+        )
+    }
+
+    fn parallel_encode_fn(
+        &self,
+    ) -> Option<
+        Arc<dyn Fn(u32, &[crate::rle::RleRun]) -> Result<Vec<u8>, SlicerV3Error> + Send + Sync>,
+    > {
+        let is_anti_aliased = self.is_anti_aliased;
+        let threshold = self.threshold;
+        let total_pixels = self.total_pixels;
+        Some(Arc::new(move |_layer_index: u32, runs: &[crate::rle::RleRun]| {
+            Ok(cxdlpv4_encoder::encode_cxdlpv4_rle_layer(
+                runs,
+                total_pixels,
+                is_anti_aliased,
+                threshold,
+            ))
+        }))
+    }
+
+    fn store_encoded_layer(&mut self, layer_index: u32, bytes: Vec<u8>) {
+        self.prepared.push(ctb_types::CtbPreparedLayer {
+            index: layer_index as usize,
+            source_len: self.total_pixels,
+            encoded: bytes,
+        });
+    }
+}
+
+impl FormatEncoder for Cxdlpv4PluginEncoder {
+    fn output_format(&self) -> &'static str {
+        cxdlpv4_encoder::CXDLPV4_OUTPUT_FORMAT
+    }
+
+    fn requires_png_layers(&self) -> bool {
+        false
+    }
+
+    fn requires_raw_mask_layers(&self) -> bool {
+        true
+    }
+
+    fn requires_area_stats_for_job(&self, job: &SliceJobV3) -> bool {
+        ctb_multi_parameter_rules_need_area_stats(&job.metadata_json)
+    }
+
+    fn create_rle_stream_encoder(
+        &self,
+        job: &SliceJobV3,
+    ) -> Result<Option<Box<dyn RleStreamEncoder>>, SlicerV3Error> {
+        // Refuse unsupported machines before the slow rasterization starts.
+        let build = parse_ctb_build_model_from_job(job);
+        cxdlpv4_encoder::resolve_cxdlpv4_machine_name(job, &build.machine_name)?;
+        let total_pixels =
+            (job.source_width_px as usize).saturating_mul(job.source_height_px as usize);
+        Ok(Some(Box::new(Cxdlpv4RleStreamingEncoder {
+            job: job.clone(),
+            is_anti_aliased: job.produces_grayscale_output(),
+            threshold: parse_threshold_from_metadata(&job.metadata_json),
+            total_pixels,
+            prepared: Vec::with_capacity(job.total_layers as usize),
+            layer_area_stats: Vec::new(),
+        })))
+    }
+
+    fn encode_container_from_rendered_layers(
+        &self,
+        job: &SliceJobV3,
+        rendered_layers: &RenderedLayersV3,
+        layer_area_stats: &[LayerAreaStatsV3],
+    ) -> Result<Vec<u8>, SlicerV3Error> {
+        let Some(raw_masks) = rendered_layers.raw_mask_layers.as_ref() else {
+            return Err(SlicerV3Error::MissingRenderedLayerPayload(
+                "raw mask layers are required for CXDLPv4 encoding".to_string(),
+            ));
+        };
+        let expected_pixels =
+            (job.source_width_px as usize).saturating_mul(job.source_height_px as usize);
+        for (idx, layer) in raw_masks.iter().enumerate() {
+            if layer.len() != expected_pixels {
+                return Err(SlicerV3Error::MissingRenderedLayerPayload(format!(
+                    "CXDLPv4 layer {idx} size mismatch: expected {expected_pixels} bytes, got {}",
+                    layer.len()
+                )));
+            }
+        }
+        let prepared = prepare_layers_for_ctb(
+            raw_masks,
+            job.produces_grayscale_output(),
+            parse_threshold_from_metadata(&job.metadata_json),
+            0,
+        );
+        cxdlpv4_encoder::build_cxdlpv4_container_bytes(job, &prepared, layer_area_stats)
+    }
+
+    fn read_layer_preview_png(
+        &self,
+        path: &Path,
+        layer_number: u32,
+    ) -> Result<Vec<u8>, SlicerV3Error> {
+        cxdlpv4_encoder::read_cxdlpv4_layer_preview_png(path, layer_number)
+            .map_err(SlicerV3Error::LayerPreview)
+    }
 }
 
 // Parsing and layout logic live in `ctb_metadata.rs` and `ctb_layout.rs`.
