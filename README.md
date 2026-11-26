@@ -1,5 +1,7 @@
 # df-plugin-ctb
 
+> **Fork notice:** this is a modified fork of [Open-Resin-Alliance/df-plugin-ctb](https://github.com/Open-Resin-Alliance/df-plugin-ctb), maintained by [gilmardr](https://github.com/gilmardr) for [Rambutan Slicer](https://github.com/gilmardr/Rambutan-Slicer). The `rambutan` branch adds post-slice CTB layer editing, island cleanup, multi-parameter rules and a Creality CXDLPv4 (`.cxdlpv4`) encoder. It is not an official Open Resin Alliance release. The original copyright and MIT license are kept in [`LICENSE`](LICENSE); the full list of changes is in the Git history.
+
 DragonFruit Plugin for the CTB Encoder
 
 ## Current status
